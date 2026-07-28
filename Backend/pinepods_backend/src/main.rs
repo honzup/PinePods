@@ -28,6 +28,11 @@ struct PodcastQuery {
 #[derive(Deserialize)]
 struct YouTubeChannelQuery {
     id: String,
+    // Optional override for how many uploads to list. When present and > 0 this
+    // takes precedence over the YOUTUBE_CHANNEL_LIMIT env default, letting the
+    // subscribe path request just a handful of videos (fast) while the deep-index
+    // path keeps using the full env default.
+    limit: Option<u32>,
 }
 
 // Hit counter for API usage tracking
@@ -362,10 +367,19 @@ async fn youtube_channel_handler(
     // be indexed (0 = unlimited / list the entire channel). NOTE: this listing uses
     // --dump-json, i.e. a full metadata extraction per video, so large limits make
     // subscribe/refresh proportionally slower and more bandwidth-heavy.
-    let channel_limit = env::var("YOUTUBE_CHANNEL_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(100);
+    // A valid (> 0) `limit` query param overrides the env default. This lets the
+    // subscribe path ask for just 1 video (it only needs the channel name/thumbnail,
+    // both derived from the first entry) while the deep-index path omits `limit` and
+    // keeps the full YOUTUBE_CHANNEL_LIMIT.
+    let channel_limit = query
+        .limit
+        .filter(|&l| l > 0)
+        .unwrap_or_else(|| {
+            env::var("YOUTUBE_CHANNEL_LIMIT")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(100)
+        });
 
     let mut yt_args: Vec<String> = vec![
         "--quiet".into(),

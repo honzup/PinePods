@@ -293,9 +293,13 @@ pub async fn get_youtube_channel_info(channel_id: &str) -> Result<HashMap<String
     let search_api_url = std::env::var("SEARCH_API_URL")
         .map_err(|_| AppError::external_error("SEARCH_API_URL environment variable not set"))?;
     
-    // Replace /api/search with /api/youtube/channel for the channel details endpoint
-    let backend_url = search_api_url.replace("/api/search", &format!("/api/youtube/channel?id={}", channel_id));
-    
+    // Replace /api/search with /api/youtube/channel for the channel details endpoint.
+    // Subscribe only needs the channel name/description/thumbnail, all of which the
+    // search-api derives from the first listed video, so cap the listing at 1 video
+    // (&limit=1) to avoid the ~300-video full-metadata extraction. Deep indexing uses
+    // a separate call (process_youtube_channel) that omits limit and fetches the full set.
+    let backend_url = search_api_url.replace("/api/search", &format!("/api/youtube/channel?id={}&limit=1", channel_id));
+
     let client = reqwest::Client::new();
     let response = client.get(&backend_url)
         .send()
