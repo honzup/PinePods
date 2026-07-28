@@ -7077,6 +7077,16 @@ body.audio-player-active .sb-bottom {
     color: #4ade80;
     line-height: 1;
 }
+.ep-downloaded-dot {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #3b82f6;
+    box-shadow: 0 0 0 2px var(--bg-color);
+}
 .ep-art-img {
     width: 96px !important;
     max-width: 96px !important;

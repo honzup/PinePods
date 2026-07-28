@@ -23200,9 +23200,13 @@ impl DatabasePool {
                     "YouTubeVideos".thumbnailurl AS episodeartwork, "YouTubeVideos".videourl AS episodeurl,
                     "YouTubeVideos".duration AS episodeduration,
                     "YouTubeVideos".listenposition AS listenduration,
-                    "YouTubeVideos".youtubevideoid AS guid
+                    "YouTubeVideos".youtubevideoid AS guid,
+                    CASE WHEN "DownloadedVideos".videoid IS NOT NULL THEN TRUE ELSE FALSE END AS downloaded
                     FROM "YouTubeVideos"
                     INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
+                    LEFT JOIN "DownloadedVideos" ON
+                        "DownloadedVideos".videoid = "YouTubeVideos".videoid
+                        AND "DownloadedVideos".userid = $2
                     WHERE "Podcasts".podcastid = $1 AND "Podcasts".userid = $2
                     ORDER BY "YouTubeVideos".publishedat DESC
                 "#)
@@ -23230,7 +23234,8 @@ impl DatabasePool {
                         "Episodeurl": row.try_get::<String, _>("episodeurl").unwrap_or_default(),
                         "Episodeduration": row.try_get::<i32, _>("episodeduration").unwrap_or(0),
                         "Listenduration": row.try_get::<i32, _>("listenduration").unwrap_or(0),
-                        "Guid": row.try_get::<String, _>("guid").unwrap_or_default()
+                        "Guid": row.try_get::<String, _>("guid").unwrap_or_default(),
+                        "Downloaded": row.try_get::<bool, _>("downloaded").unwrap_or(false)
                     });
                     episodes.push(episode);
                 }
@@ -23245,12 +23250,17 @@ impl DatabasePool {
                     YouTubeVideos.ThumbnailURL AS EpisodeArtwork, YouTubeVideos.VideoURL AS EpisodeURL,
                     YouTubeVideos.Duration AS EpisodeDuration,
                     YouTubeVideos.ListenPosition AS ListenDuration,
-                    YouTubeVideos.YouTubeVideoID AS guid
+                    YouTubeVideos.YouTubeVideoID AS guid,
+                    CASE WHEN DownloadedVideos.VideoID IS NOT NULL THEN TRUE ELSE FALSE END AS downloaded
                     FROM YouTubeVideos
                     INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                    LEFT JOIN DownloadedVideos ON
+                        DownloadedVideos.VideoID = YouTubeVideos.VideoID
+                        AND DownloadedVideos.UserID = ?
                     WHERE Podcasts.PodcastID = ? AND Podcasts.UserID = ?
                     ORDER BY YouTubeVideos.PublishedAt DESC
                 "#)
+                .bind(user_id)
                 .bind(podcast_id)
                 .bind(user_id)
                 .fetch_all(pool)
@@ -23275,7 +23285,8 @@ impl DatabasePool {
                         "Episodeurl": row.try_get::<String, _>("EpisodeURL").unwrap_or_default(),
                         "Episodeduration": row.try_get::<i32, _>("EpisodeDuration").unwrap_or(0),
                         "Listenduration": row.try_get::<i32, _>("ListenDuration").unwrap_or(0),
-                        "Guid": row.try_get::<String, _>("guid").unwrap_or_default()
+                        "Guid": row.try_get::<String, _>("guid").unwrap_or_default(),
+                        "Downloaded": row.try_get::<bool, _>("downloaded").unwrap_or(false)
                     });
                     episodes.push(episode);
                 }
