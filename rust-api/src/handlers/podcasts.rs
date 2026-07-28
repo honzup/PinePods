@@ -3221,6 +3221,11 @@ pub async fn stream_episode(
                                 warn!("Failed to update duration for lazily-downloaded video {}: {}", video_id, e);
                             }
                         }
+                        // Record the download so the "downloaded" badge lights up. episode_id is
+                        // the internal YouTubeVideos.videoid; user comes straight from the request.
+                        if let Err(e) = state.db_pool.add_downloaded_video(query.user_id, episode_id, &output_path).await {
+                            warn!("Failed to record DownloadedVideos for video {}: {}", episode_id, e);
+                        }
                         file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
                     }
                     Err(e) => {

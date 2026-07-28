@@ -592,6 +592,12 @@ pub async fn process_youtube_channel(
                     } else {
                         warn!("Could not read duration from MP3 file: {}", output_path);
                     }
+
+                    // Record the download so the "downloaded" badge lights up. video_id is the
+                    // YouTube id string; the helper resolves the internal videoid and owning user.
+                    if let Err(e) = state.db_pool.add_downloaded_video_by_youtube_id(podcast_id, video_id, &output_path).await {
+                        warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+                    }
                 }
                 Err(e) => {
                     failed_downloads += 1;

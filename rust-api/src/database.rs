@@ -22108,6 +22108,113 @@ impl DatabasePool {
         debug!("Successfully updated duration for YouTube video {}", video_id);
         Ok(())
     }
+
+    /// Idempotently record that a YouTube video's mp3 is on disk, so the "downloaded" badge
+    /// (computed from a LEFT JOIN on DownloadedVideos in the episode queries) lights up.
+    /// `video_id` is the internal YouTubeVideos.videoid PK — the column DownloadedVideos.VideoID
+    /// references and the queries join on — NOT the YouTube id string. Inserting an existing
+    /// (user, video) pair is a no-op: the eager refresh (process_youtube_channel) and the lazy
+    /// play path both re-run, so this must never error or create duplicate rows.
+    pub async fn add_downloaded_video(
+        &self,
+        user_id: i32,
+        video_id: i32,
+        location: &str,
+    ) -> AppResult<()> {
+        let file_size = tokio::fs::metadata(location)
+            .await
+            .map(|m| m.len() as i64)
+            .unwrap_or(0);
+
+        match self {
+            DatabasePool::Postgres(pool) => {
+                let existing = sqlx::query(r#"SELECT 1 FROM "DownloadedVideos" WHERE userid = $1 AND videoid = $2"#)
+                    .bind(user_id)
+                    .bind(video_id)
+                    .fetch_optional(pool)
+                    .await?;
+                if existing.is_none() {
+                    sqlx::query(r#"INSERT INTO "DownloadedVideos" (userid, videoid, downloadedsize, downloadedlocation) VALUES ($1, $2, $3, $4)"#)
+                        .bind(user_id)
+                        .bind(video_id)
+                        .bind(file_size)
+                        .bind(location)
+                        .execute(pool)
+                        .await?;
+                    debug!("Recorded DownloadedVideos row for user {} video {}", user_id, video_id);
+                }
+            }
+            DatabasePool::MySQL(pool) => {
+                let existing = sqlx::query("SELECT 1 FROM DownloadedVideos WHERE UserID = ? AND VideoID = ?")
+                    .bind(user_id)
+                    .bind(video_id)
+                    .fetch_optional(pool)
+                    .await?;
+                if existing.is_none() {
+                    sqlx::query("INSERT INTO DownloadedVideos (UserID, VideoID, DownloadedSize, DownloadedLocation) VALUES (?, ?, ?, ?)")
+                        .bind(user_id)
+                        .bind(video_id)
+                        .bind(file_size)
+                        .bind(location)
+                        .execute(pool)
+                        .await?;
+                    debug!("Recorded DownloadedVideos row for user {} video {}", user_id, video_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience wrapper for the eager-download path, which only has the YouTube id string and
+    /// a podcast id. Resolves the internal videoid and the podcast's owning user in one query,
+    /// then delegates to add_downloaded_video. A missing video row is a no-op (logged), never an
+    /// error, so a failed lookup can't break a channel refresh.
+    pub async fn add_downloaded_video_by_youtube_id(
+        &self,
+        podcast_id: i32,
+        youtube_video_id: &str,
+        location: &str,
+    ) -> AppResult<()> {
+        let resolved: Option<(i32, i32)> = match self {
+            DatabasePool::Postgres(pool) => {
+                sqlx::query(r#"
+                    SELECT "YouTubeVideos".videoid, "Podcasts".userid
+                    FROM "YouTubeVideos"
+                    INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
+                    WHERE "YouTubeVideos".youtubevideoid = $1 AND "YouTubeVideos".podcastid = $2
+                "#)
+                .bind(youtube_video_id)
+                .bind(podcast_id)
+                .fetch_optional(pool)
+                .await?
+                .map(|row| Ok::<_, crate::error::AppError>((row.try_get::<i32, _>("videoid")?, row.try_get::<i32, _>("userid")?)))
+                .transpose()?
+            }
+            DatabasePool::MySQL(pool) => {
+                sqlx::query(r#"
+                    SELECT YouTubeVideos.VideoID, Podcasts.UserID
+                    FROM YouTubeVideos
+                    INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                    WHERE YouTubeVideos.YouTubeVideoID = ? AND YouTubeVideos.PodcastID = ?
+                "#)
+                .bind(youtube_video_id)
+                .bind(podcast_id)
+                .fetch_optional(pool)
+                .await?
+                .map(|row| Ok::<_, crate::error::AppError>((row.try_get::<i32, _>("VideoID")?, row.try_get::<i32, _>("UserID")?)))
+                .transpose()?
+            }
+        };
+
+        match resolved {
+            Some((video_id, user_id)) => self.add_downloaded_video(user_id, video_id, location).await?,
+            None => warn!(
+                "Could not resolve internal video row for YouTube id {} in podcast {}; skipping DownloadedVideos insert",
+                youtube_video_id, podcast_id
+            ),
+        }
+        Ok(())
+    }
 }
 
 // Playlist configuration struct - matches Python playlist data structure exactly

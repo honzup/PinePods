@@ -642,7 +642,13 @@ impl TaskSpawner {
                         } else {
                             tracing::warn!("Could not read duration from MP3 file: {}", output_path);
                         }
-                        
+
+                        // Record the download so the "downloaded" badge lights up. video_id is the
+                        // internal YouTubeVideos.videoid PK; user_id comes from the request.
+                        if let Err(e) = db_pool.add_downloaded_video(user_id, video_id, &output_path).await {
+                            tracing::warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+                        }
+
                         Ok(serde_json::json!({
                             "video_id": video_id,
                             "user_id": user_id,
@@ -883,6 +889,13 @@ impl TaskSpawner {
                                 }
                             } else {
                                 tracing::warn!("Could not read duration from MP3 file: {}", output_path);
+                            }
+
+                            // Record the download so the "downloaded" badge lights up. Only the
+                            // YouTube id string is in scope here, so let the helper resolve the
+                            // internal videoid (and owning user) from the channel.
+                            if let Err(e) = db_pool.add_downloaded_video_by_youtube_id(channel_id, youtube_video_id, &output_path).await {
+                                tracing::warn!("Failed to record DownloadedVideos for video {}: {}", youtube_video_id, e);
                             }
                         }
                         Err(e) => {
