@@ -356,15 +356,31 @@ async fn youtube_channel_handler(
     hit_counters.increment_youtube();
 
     let channel_url = format!("https://www.youtube.com/channel/{}/videos", query.id);
+
+    // How many of a channel's most-recent uploads to list. Historically hard-capped
+    // at 15; now configurable via YOUTUBE_CHANNEL_LIMIT so a deep back-catalogue can
+    // be indexed (0 = unlimited / list the entire channel). NOTE: this listing uses
+    // --dump-json, i.e. a full metadata extraction per video, so large limits make
+    // subscribe/refresh proportionally slower and more bandwidth-heavy.
+    let channel_limit = env::var("YOUTUBE_CHANNEL_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(100);
+
+    let mut yt_args: Vec<String> = vec![
+        "--quiet".into(),
+        "--no-warnings".into(),
+        "--skip-download".into(),
+        "--dump-json".into(),
+    ];
+    if channel_limit > 0 {
+        yt_args.push("--playlist-end".into());
+        yt_args.push(channel_limit.to_string());
+    }
+    yt_args.push(channel_url);
+
     let output = Command::new("yt-dlp")
-        .args(&[
-            "--quiet",
-            "--no-warnings",
-            "--skip-download",
-            "--dump-json",
-            "--playlist-end", "15",
-            &channel_url,
-        ])
+        .args(&yt_args)
         .output()
         .await;
 
