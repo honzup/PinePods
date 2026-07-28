@@ -487,8 +487,10 @@ impl DatabasePool {
                         LEFT JOIN "DownloadedVideos" ON
                             "YouTubeVideos".videoid = "DownloadedVideos".videoid
                             AND "DownloadedVideos".userid = $4
-                        WHERE "YouTubeVideos".publishedat >= NOW() - INTERVAL '30 days'
-                        AND "YouTubeVideos".publishedat > $7
+                        -- Deep-index change: no 30-day gate on YouTube videos, so the full
+                        -- channel history is reachable in the recent feed (older items simply
+                        -- paginate below the newest). The `since` bind ($7) still applies.
+                        WHERE "YouTubeVideos".publishedat > $7
                         AND "Podcasts".userid = $5
                     ) combined
                     ORDER BY episodepubdate DESC
@@ -620,8 +622,8 @@ impl DatabasePool {
                         LEFT JOIN DownloadedVideos ON
                             YouTubeVideos.VideoID = DownloadedVideos.VideoID
                             AND DownloadedVideos.UserID = ?
-                        WHERE YouTubeVideos.PublishedAt >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                        AND YouTubeVideos.PublishedAt > ?
+                        -- Deep-index change: no 30-day gate on YouTube videos (see Postgres branch above).
+                        WHERE YouTubeVideos.PublishedAt > ?
                         AND Podcasts.UserID = ?
                     ) combined
                     ORDER BY episodepubdate DESC
@@ -21958,6 +21960,46 @@ impl DatabasePool {
         } else {
             debug!("No file found for YouTube ID: {}", youtube_id);
             Ok(None)
+        }
+    }
+
+    // Resolve the YouTube video id (e.g. "dQw4w9WgXcQ") for an internal video row, regardless
+    // of whether the audio file has been downloaded yet. Used by the lazy download-on-play path
+    // in stream_episode, which needs the id to fetch a video that is indexed but not yet cached.
+    pub async fn get_youtube_video_id(
+        &self,
+        episode_id: i32,
+        user_id: i32,
+    ) -> AppResult<Option<String>> {
+        match self {
+            DatabasePool::Postgres(pool) => {
+                let row = sqlx::query(r#"
+                    SELECT "YouTubeVideos".youtubevideoid
+                    FROM "YouTubeVideos"
+                    INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
+                    WHERE "YouTubeVideos".videoid = $1 AND "Podcasts".userid = $2
+                "#)
+                .bind(episode_id)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(|r| r.try_get::<String, _>("youtubevideoid")).transpose()?)
+            }
+            DatabasePool::MySQL(pool) => {
+                let row = sqlx::query(r#"
+                    SELECT YouTubeVideos.YouTubeVideoID
+                    FROM YouTubeVideos
+                    INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                    WHERE YouTubeVideos.VideoID = ? AND Podcasts.UserID = ?
+                "#)
+                .bind(episode_id)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?;
+
+                Ok(row.map(|r| r.try_get::<String, _>("YouTubeVideoID")).transpose()?)
+            }
         }
     }
 

@@ -381,12 +381,17 @@ pub async fn process_youtube_channel(
 ) -> Result<(), AppError> {
     debug!("Processing YouTube channel: podcast_id={} channel_id={}", podcast_id, channel_id);
 
+    // feed_cutoff now governs ONLY the eager-download window, not indexing. Videos older
+    // than this are still indexed (metadata) and are lazily downloaded on first play.
     let cutoff_date = chrono::Utc::now() - chrono::Duration::days(feed_cutoff as i64);
-    debug!("Cutoff date set to: {}", cutoff_date);
+    debug!("Eager-download cutoff date set to: {}", cutoff_date);
 
-    // Clean up old videos
-    debug!("Cleaning up videos older than cutoff date...");
-    state.db_pool.remove_old_youtube_videos(podcast_id, cutoff_date).await?;
+    // NOTE: We deliberately no longer prune old videos here. The deep index (the entire
+    // channel history) must survive across refreshes so older videos stay visible and can
+    // be lazily downloaded on first play. This previously called
+    // `remove_old_youtube_videos(podcast_id, cutoff_date)`, which deleted YouTubeVideos rows
+    // (plus their downloaded files, history, saved/queue entries) older than the cutoff — that
+    // would destroy the deep index on every refresh. Left intentionally removed.
 
     // Get Backend URL from environment variable
     let search_api_url = std::env::var("SEARCH_API_URL")
@@ -479,10 +484,8 @@ pub async fn process_youtube_channel(
 
         info!("Video publish date: {}", published);
 
-        if published <= cutoff_date {
-            info!("Video {} from {} is too old, stopping processing", video_id, published);
-            break;
-        }
+        // Index the ENTIRE channel history (metadata only). We no longer skip or stop on
+        // old videos here — feed_cutoff only bounds the eager-download loop further below.
 
         // Debug: print what we got from Backend for this video
         info!("Backend video data for {}: {:?}", video_id, video_entry);
@@ -545,7 +548,20 @@ pub async fn process_youtube_channel(
         for video in &recent_videos {
             let video_id = video.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let title = video.get("title").and_then(|v| v.as_str()).unwrap_or("");
-            
+
+            // Eager-download window: only download videos published within feed_cutoff days
+            // of now. Everything older stays indexed-only and is lazily downloaded on first
+            // play (see `stream_episode` in handlers/podcasts.rs).
+            let published = video.get("publish_date").and_then(|v| v.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            if let Some(p) = published {
+                if p <= cutoff_date {
+                    debug!("Video {} is outside the eager-download window, deferring to lazy download", video_id);
+                    continue;
+                }
+            }
+
             let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", video_id);
             let output_path_double = format!("{}.mp3", output_path);
 

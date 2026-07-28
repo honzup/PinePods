@@ -5,6 +5,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -12,6 +14,17 @@ use crate::{
     handlers::{extract_api_key, validate_api_key, check_user_access},
     AppState,
 };
+
+lazy_static::lazy_static! {
+    // Per-YouTube-video download locks for the lazy download-on-play path. Browsers fire
+    // several parallel HTTP range requests at an audio source; without a per-id lock we would
+    // spawn multiple concurrent yt-dlp runs for the same video and corrupt the file. Each video
+    // id maps to its own async mutex; the outer std mutex only guards the map itself and is held
+    // briefly (never across an await). Entries are left in place after use — one small Arc per
+    // distinct video ever lazily played, which is negligible.
+    static ref YT_DOWNLOAD_LOCKS: StdMutex<HashMap<String, Arc<AsyncMutex<()>>>> =
+        StdMutex::new(HashMap::new());
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, utoipa::ToSchema)]
 #[allow(non_snake_case)]
@@ -3178,9 +3191,50 @@ pub async fn stream_episode(
         }
     }
 
+    // Lazy download-on-play for YouTube: the deep index contains videos that were never
+    // eagerly downloaded (older than the podcast's feed cutoff). If the mp3 is missing, fetch
+    // it now, cache it to disk, then serve it via the normal ServeFile path below. A per-video
+    // lock serialises the parallel range requests a browser fires at an audio source so we never
+    // run yt-dlp twice for the same id (which would corrupt the file).
+    if file_path.is_none() && query.source_type.as_deref() == Some("youtube") {
+        if let Some(video_id) = state.db_pool.get_youtube_video_id(episode_id, query.user_id).await? {
+            let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", video_id);
+
+            // Get-or-create this id's lock, holding the map mutex only briefly (no await while held).
+            let lock = {
+                let mut map = YT_DOWNLOAD_LOCKS.lock().unwrap();
+                map.entry(video_id.clone())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                    .clone()
+            };
+            let _guard = lock.lock().await;
+
+            // Re-check under the lock: another request may have finished the download while we waited.
+            file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
+            if file_path.is_none() {
+                info!("Lazy-downloading YouTube video {} on first play", video_id);
+                match crate::handlers::youtube::download_youtube_audio(&video_id, &output_path).await {
+                    Ok(_) => {
+                        // Best-effort: refresh the stored duration from the freshly downloaded file.
+                        if let Some(duration) = crate::handlers::youtube::get_mp3_duration(&output_path) {
+                            if let Err(e) = state.db_pool.update_youtube_video_duration(&video_id, duration).await {
+                                warn!("Failed to update duration for lazily-downloaded video {}: {}", video_id, e);
+                            }
+                        }
+                        file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
+                    }
+                    Err(e) => {
+                        error!("Lazy download failed for YouTube video {}: {}", video_id, e);
+                        return Err(AppError::external_error(&format!("Failed to download YouTube audio: {}", e)));
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(path) = file_path {
         debug!("Found file at: {}", path);
-        
+
         // Use tower_http's ServeFile for proper file serving with range support
         use tower_http::services::ServeFile;
         use tower::ServiceExt;
