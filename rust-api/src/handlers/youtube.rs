@@ -10,7 +10,7 @@ use tokio::process::Command;
 /// applied via the child's own proxy env vars, so the reqwest RSS client in this process is
 /// unaffected and keeps its direct path. Lets YouTube use a residential IP without dragging RSS
 /// through the same egress. Empty/unset = no proxy (direct), so it stays a no-op by default.
-fn ytdlp_command() -> Command {
+pub(crate) fn ytdlp_command() -> Command {
     let mut cmd = Command::new("yt-dlp");
     if let Ok(proxy) = std::env::var("YTDLP_PROXY") {
         if !proxy.is_empty() {

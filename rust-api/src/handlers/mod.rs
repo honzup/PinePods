@@ -10,6 +10,7 @@ pub mod proxy;
 pub mod settings;
 pub mod sync;
 pub mod youtube;
+pub mod youtube_stream;
 pub mod tasks;
 pub mod feed;
 pub mod local_podcast;

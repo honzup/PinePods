@@ -3213,25 +3213,45 @@ pub async fn stream_episode(
             // Re-check under the lock: another request may have finished the download while we waited.
             file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
             if file_path.is_none() {
-                info!("Lazy-downloading YouTube video {} on first play", video_id);
-                match crate::handlers::youtube::download_youtube_audio(&video_id, &output_path).await {
-                    Ok(_) => {
-                        // Best-effort: refresh the stored duration from the freshly downloaded file.
-                        if let Some(duration) = crate::handlers::youtube::get_mp3_duration(&output_path) {
-                            if let Err(e) = state.db_pool.update_youtube_video_duration(&video_id, duration).await {
-                                warn!("Failed to update duration for lazily-downloaded video {}: {}", video_id, e);
-                            }
-                        }
-                        // Record the download so the "downloaded" badge lights up. episode_id is
-                        // the internal YouTubeVideos.videoid; user comes straight from the request.
-                        if let Err(e) = state.db_pool.add_downloaded_video(query.user_id, episode_id, &output_path).await {
-                            warn!("Failed to record DownloadedVideos for video {}: {}", episode_id, e);
-                        }
+                info!("Lazy-streaming YouTube video {} on first play", video_id);
+                // Start (or attach to) the progressive download-while-streaming pipeline. The lock
+                // above only serialises this brief start/attach decision; the tailing body streams
+                // after this handler returns (the lock is already dropped by then), so concurrent
+                // plays of the same video attach as extra tailers rather than starting a second
+                // download. See handlers/youtube_stream.rs.
+                match crate::handlers::youtube_stream::begin_stream(&state, &video_id, query.user_id, episode_id).await {
+                    crate::handlers::youtube_stream::StreamStart::Live(producer) => {
+                        drop(_guard);
+                        return Ok(crate::handlers::youtube_stream::chunked_response(producer));
+                    }
+                    crate::handlers::youtube_stream::StreamStart::Cached => {
+                        // Producer finished (and cached) during the probe — serve via ServeFile below.
                         file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
                     }
-                    Err(e) => {
-                        error!("Lazy download failed for YouTube video {}: {}", video_id, e);
-                        return Err(AppError::external_error(&format!("Failed to download YouTube audio: {}", e)));
+                    crate::handlers::youtube_stream::StreamStart::Fallback => {
+                        // Progressive pipeline couldn't serve this video; fall back to the old
+                        // blocking download so nothing is worse than before, then ServeFile below.
+                        info!("Falling back to blocking download for YouTube video {}", video_id);
+                        match crate::handlers::youtube::download_youtube_audio(&video_id, &output_path).await {
+                            Ok(_) => {
+                                // Best-effort: refresh the stored duration from the freshly downloaded file.
+                                if let Some(duration) = crate::handlers::youtube::get_mp3_duration(&output_path) {
+                                    if let Err(e) = state.db_pool.update_youtube_video_duration(&video_id, duration).await {
+                                        warn!("Failed to update duration for lazily-downloaded video {}: {}", video_id, e);
+                                    }
+                                }
+                                // Record the download so the "downloaded" badge lights up. episode_id is
+                                // the internal YouTubeVideos.videoid; user comes straight from the request.
+                                if let Err(e) = state.db_pool.add_downloaded_video(query.user_id, episode_id, &output_path).await {
+                                    warn!("Failed to record DownloadedVideos for video {}: {}", episode_id, e);
+                                }
+                                file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
+                            }
+                            Err(e) => {
+                                error!("Lazy download failed for YouTube video {}: {}", video_id, e);
+                                return Err(AppError::external_error(&format!("Failed to download YouTube audio: {}", e)));
+                            }
+                        }
                     }
                 }
             }
