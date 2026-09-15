@@ -6323,6 +6323,7 @@ impl DatabasePool {
         let client = reqwest::Client::builder()
             .user_agent("PinePods/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(AppError::Http)?;
 
@@ -6492,24 +6493,42 @@ impl DatabasePool {
         let client = reqwest::Client::builder()
             .user_agent("PinePods/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| {
                 warn!("Failed to build HTTP client: {}", e);
                 AppError::Http(e)
             })?;
-            
-        let mut request = client.get(url);
-        
-        if let (Some(user), Some(pass)) = (username, password) {
-            debug!("Adding basic authentication to feed request");
-            request = request.basic_auth(user, Some(pass));
-        }
-        
+
+        // Some hosts intermittently drop the connect over our egress path (one attempt in a few
+        // times out), which would otherwise silently skip the feed for the whole refresh cycle.
+        // Retry the transport a few times before giving up. ponytail: fixed 3 tries + linear
+        // backoff; only transport errors are retried, HTTP status handling is left below.
+        let build_request = || {
+            let mut r = client.get(url);
+            if let (Some(user), Some(pass)) = (username, password) {
+                r = r.basic_auth(user, Some(pass));
+            }
+            r
+        };
         debug!("Sending HTTP request to: {}", url);
-        let response = request.send().await.map_err(|e| {
-            warn!("HTTP request failed for {}: {}", url, e);
-            AppError::Http(e)
-        })?;
+        let response = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match build_request().send().await {
+                    Ok(resp) => break resp,
+                    Err(e) if attempt < 3 => {
+                        warn!("HTTP request to {} failed (attempt {}/3): {} - retrying", url, attempt, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    }
+                    Err(e) => {
+                        warn!("HTTP request failed for {} after {} attempts: {}", url, attempt, e);
+                        return Err(AppError::Http(e));
+                    }
+                }
+            }
+        };
         
         if !response.status().is_success() {
             // If we get a 403, the server might be blocking podcast client User-Agents.
