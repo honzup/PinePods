@@ -13,6 +13,11 @@ use tracing::{debug, error, info, warn};
 // Global temporary MFA secrets storage (matches Python temp_mfa_secrets)
 lazy_static! {
     static ref TEMP_MFA_SECRETS: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Per-podcast cache of parsed podcasting-2.0 data (podcast_id -> (expires_at, value)).
+    // The mobile app blocks the podcast view on a live feed fetch for this; caching keeps opens
+    // instant. Successful fetches carry a long TTL; failures negative-cache the last-known/empty
+    // value for a short TTL so an unreachable feed host can't make every open pay the timeout.
+    static ref POD2_CACHE: Mutex<HashMap<i32, (std::time::Instant, serde_json::Value)>> = Mutex::new(HashMap::new());
 }
 
 #[derive(Clone)]
@@ -9207,6 +9212,60 @@ impl DatabasePool {
 
     // Fetch podcasting 2.0 podcast data
     pub async fn fetch_podcasting_2_pod_data(&self, podcast_id: i32, user_id: i32) -> AppResult<serde_json::Value> {
+        // Interactive: the mobile app blocks the podcast view on this call, which live-fetches the
+        // feed. Cache the parsed 2.0 data per podcast so opens are instant, cap the (re)fetch so a
+        // flaky feed host can't hang the caller, and serve stale/empty rather than a ~30s 502.
+        // ponytail: in-process TTL cache, cleared on restart (one cold fetch per podcast) - fine at this scale.
+        const POD2_OK_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+        const POD2_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        const POD2_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        let now = std::time::Instant::now();
+
+        // Serve any unexpired cache entry (a fresh success, or a still-valid negative entry) with
+        // no fetch at all.
+        {
+            let cache = POD2_CACHE.lock().unwrap();
+            if let Some((expires_at, value)) = cache.get(&podcast_id) {
+                if now < *expires_at {
+                    return Ok(value.clone());
+                }
+            }
+        }
+
+        match tokio::time::timeout(
+            POD2_FETCH_TIMEOUT,
+            self.fetch_podcasting_2_pod_data_live(podcast_id, user_id),
+        )
+        .await
+        {
+            Ok(Ok(data)) => {
+                POD2_CACHE
+                    .lock()
+                    .unwrap()
+                    .insert(podcast_id, (now + POD2_OK_TTL, data.clone()));
+                Ok(data)
+            }
+            outcome => {
+                match &outcome {
+                    Ok(Err(e)) => warn!("Podcast 2.0 fetch failed for podcast {}: {} - negative-caching for {}s", podcast_id, e, POD2_FAIL_TTL.as_secs()),
+                    Err(_) => warn!("Podcast 2.0 fetch timed out for podcast {} - negative-caching for {}s", podcast_id, POD2_FAIL_TTL.as_secs()),
+                    _ => {}
+                }
+                // Reuse the last-known value (stale hosts) if we have one, else an empty shape, and
+                // negative-cache it briefly: repeated opens during an outage are then instant, and
+                // we re-check after POD2_FAIL_TTL so recovery is picked up.
+                let mut cache = POD2_CACHE.lock().unwrap();
+                let value = cache
+                    .get(&podcast_id)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| serde_json::json!({ "people": [], "podroll": [], "funding": [], "value": null }));
+                cache.insert(podcast_id, (now + POD2_FAIL_TTL, value.clone()));
+                Ok(value)
+            }
+        }
+    }
+
+    async fn fetch_podcasting_2_pod_data_live(&self, podcast_id: i32, user_id: i32) -> AppResult<serde_json::Value> {
         // Get podcast details to fetch the feed URL and authentication
         let podcast_details = self.get_podcast_details(user_id, podcast_id).await?;
         
