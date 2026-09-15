@@ -5,6 +5,21 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+
+/// Build a yt-dlp Command, routing only its egress through `YTDLP_PROXY` when set. The proxy is
+/// applied via the child's own proxy env vars, so the reqwest RSS client in this process is
+/// unaffected and keeps its direct path. Lets YouTube use a residential IP without dragging RSS
+/// through the same egress. Empty/unset = no proxy (direct), so it stays a no-op by default.
+fn ytdlp_command() -> Command {
+    let mut cmd = Command::new("yt-dlp");
+    if let Ok(proxy) = std::env::var("YTDLP_PROXY") {
+        if !proxy.is_empty() {
+            cmd.env("HTTP_PROXY", &proxy);
+            cmd.env("HTTPS_PROXY", &proxy);
+        }
+    }
+    cmd
+}
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
@@ -97,7 +112,7 @@ pub async fn search_youtube_channels(
     info!("Searching YouTube with query: {}", query.query);
     
     // Use yt-dlp binary to search
-    let output = Command::new("yt-dlp")
+    let output = ytdlp_command()
         .args(&[
             "--quiet",
             "--no-warnings",
@@ -647,7 +662,7 @@ pub async fn download_youtube_audio(video_id: &str, output_path: &str) -> Result
 
     let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
-    let output = Command::new("yt-dlp")
+    let output = ytdlp_command()
         .args(&[
             "--format", "bestaudio/best",
             "--extract-audio",

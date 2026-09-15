@@ -11,6 +11,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
+
+/// Build a yt-dlp Command, routing only its egress through `YTDLP_PROXY` when set (applied via the
+/// child's proxy env vars). Empty/unset = direct, so it's a no-op by default.
+fn ytdlp_command() -> Command {
+    let mut cmd = Command::new("yt-dlp");
+    if let Ok(proxy) = std::env::var("YTDLP_PROXY") {
+        if !proxy.is_empty() {
+            cmd.env("HTTP_PROXY", &proxy);
+            cmd.env("HTTPS_PROXY", &proxy);
+        }
+    }
+    cmd
+}
 use chrono;
 
 #[derive(Deserialize)]
@@ -220,7 +233,7 @@ async fn search_youtube_channels(search_term: &str) -> HttpResponse {
     println!("Searching YouTube with yt-dlp for: {}", search_term);
 
     let search_url = format!("ytsearch25:{}", search_term);
-    let output = Command::new("yt-dlp")
+    let output = ytdlp_command()
         .args(&[
             "--quiet",
             "--no-warnings",
@@ -393,7 +406,7 @@ async fn youtube_channel_handler(
     }
     yt_args.push(channel_url);
 
-    let output = Command::new("yt-dlp")
+    let output = ytdlp_command()
         .args(&yt_args)
         .output()
         .await;
