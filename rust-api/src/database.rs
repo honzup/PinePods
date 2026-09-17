@@ -11214,6 +11214,15 @@ impl DatabasePool {
                         .await?;
                     debug!("Inserted new YouTube listen duration record for user {} video {} with duration {}", user_id, video_id, listen_duration_int);
                 }
+                // Mirror the position onto YouTubeVideos.listenposition (monotonic):
+                // the read path (get_episode_metadata / episode lists) reads
+                // listenposition, NOT UserVideoHistory, so without this a YouTube
+                // episode's position is recorded but never read back (no resume).
+                sqlx::query(r#"UPDATE "YouTubeVideos" SET listenposition = $1 WHERE videoid = $2 AND listenposition < $1"#)
+                    .bind(listen_duration_int)
+                    .bind(video_id)
+                    .execute(pool)
+                    .await?;
             }
             DatabasePool::MySQL(pool) => {
                 // Check if record exists and get existing duration
@@ -11249,6 +11258,12 @@ impl DatabasePool {
                         .await?;
                     debug!("Inserted new YouTube listen duration record for user {} video {} with duration {}", user_id, video_id, listen_duration_int);
                 }
+                sqlx::query("UPDATE YouTubeVideos SET ListenPosition = ? WHERE VideoID = ? AND ListenPosition < ?")
+                    .bind(listen_duration_int)
+                    .bind(video_id)
+                    .bind(listen_duration_int)
+                    .execute(pool)
+                    .await?;
             }
         }
         Ok(())
