@@ -394,42 +394,59 @@ async fn youtube_channel_handler(
                 .unwrap_or(100)
         });
 
-    let mut yt_args: Vec<String> = vec![
-        "--quiet".into(),
-        "--no-warnings".into(),
-        "--skip-download".into(),
-        "--dump-json".into(),
-    ];
-    if channel_limit > 0 {
-        yt_args.push("--playlist-end".into());
-        yt_args.push(channel_limit.to_string());
-    }
-    yt_args.push(channel_url);
-
-    let output = ytdlp_command()
-        .args(&yt_args)
-        .output()
-        .await;
-
-    let output = match output {
-        Ok(o) => o,
-        Err(e) => {
-            error!("Failed to execute yt-dlp: {}", e);
-            return HttpResponse::InternalServerError().body("yt-dlp not available");
-        }
+    // --ignore-errors: skip members-only / unavailable videos rather than aborting
+    // the whole channel fetch. Some channels gate their most-recent uploads behind
+    // membership, and extracting one of those errors out; without this the entire
+    // subscribe fails with a 500. A non-zero yt-dlp exit is therefore expected here
+    // and is NOT treated as fatal as long as some public videos came back.
+    //
+    // The subscribe path asks for a tiny window (it only needs the channel
+    // name/thumbnail from the first entry). If that window happens to be entirely
+    // members-only, widen it once to find a public video to read the name from.
+    let windows: Vec<u32> = if channel_limit > 0 && channel_limit < 10 {
+        vec![channel_limit, 40]
+    } else {
+        vec![channel_limit]
     };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("yt-dlp channel fetch failed: {}", stderr);
-        return HttpResponse::InternalServerError().body("yt-dlp channel fetch failed");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let mut entries: Vec<serde_json::Value> = Vec::new();
-    for line in stdout.lines() {
-        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-            entries.push(entry);
+    for end in windows {
+        let mut yt_args: Vec<String> = vec![
+            "--quiet".into(),
+            "--no-warnings".into(),
+            "--ignore-errors".into(),
+            "--skip-download".into(),
+            "--dump-json".into(),
+        ];
+        if end > 0 {
+            yt_args.push("--playlist-end".into());
+            yt_args.push(end.to_string());
+        }
+        yt_args.push(channel_url.clone());
+
+        match ytdlp_command().args(&yt_args).output().await {
+            Ok(o) => {
+                entries = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                    .collect();
+                if !o.status.success() {
+                    error!(
+                        "yt-dlp channel fetch non-zero exit (window {}, {} usable videos): {}",
+                        end,
+                        entries.len(),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                }
+            }
+            Err(e) => {
+                error!("Failed to execute yt-dlp: {}", e);
+                return HttpResponse::InternalServerError().body("yt-dlp not available");
+            }
+        }
+
+        if !entries.is_empty() {
+            break;
         }
     }
 
