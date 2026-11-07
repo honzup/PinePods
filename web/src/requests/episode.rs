@@ -62,6 +62,7 @@ pub struct Episode {
     #[serde(alias = "is_queued")]
     pub queued: bool,
     #[serde(alias = "is_downloaded")]
+    #[serde(alias = "Downloaded")]
     pub downloaded: bool,
     pub is_youtube: bool,
     pub is_video: bool,
