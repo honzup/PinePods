@@ -481,9 +481,6 @@ pub fn episode_list_item(props: &EpisodeListItemProps) -> Html {
                     if is_completed {
                         <div class="ep-art-badge"><i class="ph ph-check-circle"></i></div>
                     }
-                    if props.episode.downloaded {
-                        <span class="ep-downloaded-dot" title="Downloaded"></span>
-                    }
                 </div>
 
                 <div class="ep-body">
@@ -530,6 +527,9 @@ pub fn episode_list_item(props: &EpisodeListItemProps) -> Html {
 
                 if !props.episode.episodeurl.is_empty() {
                     <div class="ep-actions">
+                        if props.episode.downloaded {
+                            <span class="ep-downloaded-dot" title="Downloaded"></span>
+                        }
                         <button
                             class="ico"
                             onclick={on_play_pause.clone()}
