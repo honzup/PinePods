@@ -8227,18 +8227,18 @@ impl DatabasePool {
 
         // Always issue the request (even with no prior validators) so we can capture ETag /
         // Last-Modified for next time.
-        let mut request = crate::services::http::feed_client().get(url);
-        if let (Some(user), Some(pass)) = (username, password) {
-            request = request.basic_auth(user, Some(pass));
-        }
-        if let Some(etag) = prev.etag {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        if let Some(lm) = prev.last_modified {
-            request = request.header(reqwest::header::IF_MODIFIED_SINCE, lm);
-        }
+        let build_request = || {
+            let mut request = Self::feed_get(crate::services::http::feed_client(), url, username, password);
+            if let Some(etag) = prev.etag {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(lm) = prev.last_modified {
+                request = request.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+            }
+            request
+        };
 
-        let response = request.send().await.map_err(|e| {
+        let response = crate::services::http::send_with_retry(url, build_request).await.map_err(|e| {
             warn!("Feed request failed for {}: {}", url, e);
             AppError::Http(e)
         })?;
@@ -8527,13 +8527,14 @@ impl DatabasePool {
 
         // PinePods UA first — many hosts (e.g. Omny) return full episode lists to podcast apps
         // but truncated/paginated feeds to browser UAs.
-        let response = Self::feed_get(crate::services::http::feed_client(), url, username, password)
-            .send()
-            .await
-            .map_err(|e| {
-                warn!("HTTP request failed for {}: {}", url, e);
-                AppError::Http(e)
-            })?;
+        let response = crate::services::http::send_with_retry(url, || {
+            Self::feed_get(crate::services::http::feed_client(), url, username, password)
+        })
+        .await
+        .map_err(|e| {
+            warn!("HTTP request failed for {}: {}", url, e);
+            AppError::Http(e)
+        })?;
 
         if response.status().is_success() {
             debug!("Request succeeded with status: {}", response.status());

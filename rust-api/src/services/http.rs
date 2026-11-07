@@ -14,6 +14,10 @@ pub const BROWSER_USER_AGENT: &str =
 
 const FEED_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A bad connect fails fast instead of eating the whole feed timeout, so a retry can follow.
+const FEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Transport attempts per feed fetch (see [`send_with_retry`]).
+pub const FEED_SEND_ATTEMPTS: u32 = 3;
 
 static FEED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| feed_builder(PINEPODS_USER_AGENT).build().expect("feed HTTP client"));
 
@@ -48,7 +52,31 @@ fn feed_builder(user_agent: &str) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(user_agent)
         .timeout(FEED_TIMEOUT)
+        .connect_timeout(FEED_CONNECT_TIMEOUT)
         .redirect(crate::services::url_guard::guarded_redirect_policy())
+}
+
+/// Send a feed request, retrying transport failures. Some hosts intermittently drop the connect
+/// over our egress path, which would otherwise silently skip the feed for the whole refresh
+/// cycle. `build` makes a fresh request per attempt (a RequestBuilder is consumed by `send`).
+/// Only transport errors are retried – any HTTP answer, whatever its status, is returned to the
+/// caller's status handling – and redirect refusals (the SSRF guard) are never retried.
+pub async fn send_with_retry<F>(url: &str, build: F) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match build().send().await {
+            Ok(response) => return Ok(response),
+            Err(e) if attempt < FEED_SEND_ATTEMPTS && !e.is_redirect() && !e.is_builder() => {
+                tracing::warn!("Feed request to {} failed (attempt {}/{}): {} - retrying", url, attempt, FEED_SEND_ATTEMPTS, e);
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// RSS feed fetches: PinePods UA, 30s timeout, redirects re-checked by the SSRF guard.
@@ -115,6 +143,46 @@ mod tests {
         assert_eq!(parse_retry_after("Wed, 21 Oct 2026 11:00:00 GMT", now), Some(Duration::ZERO), "past dates mean now");
         assert_eq!(parse_retry_after("999999999", now), Some(MAX_RETRY_AFTER));
         assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retries_transport_errors_then_gives_up() {
+        // A port nothing listens on: every connect is refused.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{}/feed", port);
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let client = reqwest::Client::new();
+        let result = send_with_retry(&url, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get(&url)
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), FEED_SEND_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_does_not_retry_an_http_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/feed", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+            }
+        });
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let client = reqwest::Client::new();
+        let response = send_with_retry(&url, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            client.get(&url)
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
