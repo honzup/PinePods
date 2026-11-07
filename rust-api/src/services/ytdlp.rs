@@ -23,6 +23,21 @@ pub fn ytdlp_binary() -> String {
     std::env::var("YTDLP_PATH").unwrap_or_else(|_| "yt-dlp".to_string())
 }
 
+/// A yt-dlp [`Command`] for [`ytdlp_binary`], routing only its egress through `YTDLP_PROXY` when
+/// set. The proxy is applied via the child's own `HTTP_PROXY`/`HTTPS_PROXY`, so the reqwest RSS
+/// client in this process is unaffected and keeps its direct path – YouTube can use a residential
+/// IP without dragging feed fetches through the same egress. Empty/unset = direct (no-op).
+pub fn ytdlp_command() -> Command {
+    let mut cmd = Command::new(ytdlp_binary());
+    if let Ok(proxy) = std::env::var("YTDLP_PROXY") {
+        if !proxy.is_empty() {
+            cmd.env("HTTP_PROXY", &proxy);
+            cmd.env("HTTPS_PROXY", &proxy);
+        }
+    }
+    cmd
+}
+
 /// yt-dlp processes the feed refresh may run at once. Each one is heavy and talks to YouTube, so
 /// this is far below the refresh's feed concurrency.
 const REFRESH_PROCESSES: usize = 3;
@@ -161,7 +176,7 @@ async fn record_result(db_pool: &DatabasePool, result: &str) -> Result<(), Strin
 /// Current yt-dlp version (`yt-dlp --version`), trimmed. Doubles as a health check.
 pub async fn current_version() -> Result<String, String> {
     let bin = ytdlp_binary();
-    let output = Command::new(&bin)
+    let output = ytdlp_command()
         .arg("--version")
         .output()
         .await
@@ -180,7 +195,7 @@ pub async fn run_update(channel: &str) -> Result<String, String> {
     let channel = normalize_channel(channel);
     info!("yt-dlp: updating {} to '{}' channel", bin, channel);
 
-    let output = Command::new(&bin)
+    let output = ytdlp_command()
         .args(["--update-to", channel])
         .output()
         .await

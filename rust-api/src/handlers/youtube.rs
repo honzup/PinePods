@@ -4,14 +4,13 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, warn};
 
 use crate::{
     error::AppError,
     handlers::{extract_api_key, require_valid_api_key},
-    services::ytdlp::ytdlp_binary,
+    services::ytdlp::{ytdlp_binary, ytdlp_command},
     AppState,
 };
 
@@ -99,7 +98,7 @@ pub async fn search_youtube_channels(
     
     // Use the local yt-dlp binary to search
     let bin = ytdlp_binary();
-    let output = Command::new(&bin)
+    let output = ytdlp_command()
         .args(&[
             "--quiet",
             "--no-warnings",
@@ -294,7 +293,7 @@ pub async fn subscribe_to_youtube_channel(
 // Run the local yt-dlp binary (#793).
 async fn run_ytdlp(args: &[&str]) -> Result<std::process::Output, AppError> {
     let bin = ytdlp_binary();
-    Command::new(&bin).args(args).output().await.map_err(|e| {
+    ytdlp_command().args(args).output().await.map_err(|e| {
         error!("Failed to execute yt-dlp {}: {}", bin, e);
         AppError::external_error(&format!("Failed to execute yt-dlp: {}", e))
     })
@@ -807,7 +806,7 @@ pub async fn download_youtube_audio(video_id: &str, output_path: &str) -> Result
     let video_url = format!("https://www.youtube.com/watch?v={}", video_id);
 
     let bin = ytdlp_binary();
-    let output = Command::new(&bin)
+    let output = ytdlp_command()
         .args(&[
             "--format", "bestaudio/best",
             "--extract-audio",
