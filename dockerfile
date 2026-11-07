@@ -85,7 +85,7 @@ FROM alpine
 LABEL maintainer="Collin Pendleton <collinp@collinpendleton.com>"
 # Install runtime dependencies
 # su-exec: drop privileges to PUID:PGID at startup. shadow: usermod/groupmod to remap the runtime user's IDs.
-RUN apk add --no-cache tzdata nginx openssl bash mariadb-client postgresql-client curl ffmpeg wget jq mariadb-connector-c-dev su-exec shadow
+RUN apk add --no-cache tzdata nginx openssl bash mariadb-client postgresql-client curl ffmpeg wget jq mariadb-connector-c-dev su-exec shadow deno
 
 # Create a fixed runtime user/group (default 911); startup.sh remaps these to PUID/PGID at runtime
 RUN addgroup -g 911 pinepods && \
