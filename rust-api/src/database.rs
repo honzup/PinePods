@@ -20800,6 +20800,92 @@ impl DatabasePool {
         debug!("Successfully updated duration for YouTube video {}", video_id);
         Ok(())
     }
+
+    /// Idempotently record that a YouTube video's mp3 is on disk for this user, so the
+    /// "downloaded" badge (a LEFT JOIN on DownloadedVideos in the episode queries) lights up.
+    /// `video_id` is the internal YouTubeVideos.videoid, not the YouTube id string. Recording an
+    /// existing (user, video) pair, or a file that isn't on disk, is a no-op: the refresh, the
+    /// download tasks and the lazy play path all call this, so it must never error on a repeat.
+    pub async fn add_downloaded_video(&self, user_id: i32, video_id: i32, location: &str) -> AppResult<()> {
+        let file_size = match tokio::fs::metadata(location).await {
+            Ok(m) => m.len() as i64,
+            Err(_) => {
+                debug!("Not recording download of video {}: {} is not on disk", video_id, location);
+                return Ok(());
+            }
+        };
+        let inserted = match self {
+            DatabasePool::Postgres(pool) => {
+                sqlx::query(r#"
+                    INSERT INTO "DownloadedVideos" (userid, videoid, downloadedsize, downloadedlocation)
+                    SELECT $1, $2, $3, $4
+                    WHERE NOT EXISTS (SELECT 1 FROM "DownloadedVideos" WHERE userid = $1 AND videoid = $2)
+                "#)
+                .bind(user_id)
+                .bind(video_id)
+                .bind(file_size)
+                .bind(location)
+                .execute(pool)
+                .await?
+                .rows_affected()
+            }
+            DatabasePool::MySQL(pool) => {
+                sqlx::query(r#"
+                    INSERT INTO DownloadedVideos (UserID, VideoID, DownloadedSize, DownloadedLocation)
+                    SELECT ?, ?, ?, ? FROM DUAL
+                    WHERE NOT EXISTS (SELECT 1 FROM DownloadedVideos WHERE UserID = ? AND VideoID = ?)
+                "#)
+                .bind(user_id)
+                .bind(video_id)
+                .bind(file_size)
+                .bind(location)
+                .bind(user_id)
+                .bind(video_id)
+                .execute(pool)
+                .await?
+                .rows_affected()
+            }
+        };
+        if inserted > 0 {
+            debug!("Recorded DownloadedVideos row for user {} video {}", user_id, video_id);
+        }
+        Ok(())
+    }
+
+    /// `add_downloaded_video` for paths that only know a channel podcast and the YouTube id:
+    /// resolves the internal videoid and the podcast's owner. A missing video row is logged and
+    /// skipped, never an error, so a failed lookup can't break a channel refresh.
+    pub async fn add_downloaded_video_by_youtube_id(&self, podcast_id: i32, youtube_video_id: &str, location: &str) -> AppResult<()> {
+        let resolved: Option<(i32, i32)> = match self {
+            DatabasePool::Postgres(pool) => sqlx::query_as(r#"
+                    SELECT "YouTubeVideos".videoid, "Podcasts".userid
+                    FROM "YouTubeVideos"
+                    INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
+                    WHERE "YouTubeVideos".youtubevideoid = $1 AND "YouTubeVideos".podcastid = $2
+                "#)
+                .bind(youtube_video_id)
+                .bind(podcast_id)
+                .fetch_optional(pool)
+                .await?,
+            DatabasePool::MySQL(pool) => sqlx::query_as(r#"
+                    SELECT YouTubeVideos.VideoID, Podcasts.UserID
+                    FROM YouTubeVideos
+                    INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                    WHERE YouTubeVideos.YouTubeVideoID = ? AND YouTubeVideos.PodcastID = ?
+                "#)
+                .bind(youtube_video_id)
+                .bind(podcast_id)
+                .fetch_optional(pool)
+                .await?,
+        };
+        match resolved {
+            Some((video_id, user_id)) => self.add_downloaded_video(user_id, video_id, location).await,
+            None => {
+                warn!("No video {} in podcast {}; not recording its download", youtube_video_id, podcast_id);
+                Ok(())
+            }
+        }
+    }
 }
 
 // Playlist configuration struct - matches Python playlist data structure exactly

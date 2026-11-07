@@ -358,3 +358,44 @@ async fn a_members_only_newest_video_does_not_block_subscribing() {
     assert_eq!(text(&app, &column("ArtworkURL")).await, Some(format!("https://yt3.example/{}/avatar", channel.id)));
     assert_eq!(app.video_ids(pod).await, vec![channel.video_id(1)]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloaded_videos_are_recorded_once_and_only_when_on_disk() {
+    let app = TestApp::new().await;
+    let user = app.user("saver").await;
+    let channel = app.youtube_channel("dlrec").video(1, 1).video(2, 2);
+    app.publish_channel(&channel);
+    let pod = app.subscribe_channel(&user, &channel, 30).await;
+    let video_row = |n: u32| {
+        let yt = channel.video_id(n);
+        let app = &app;
+        async move {
+            int(app, &format!(r#"SELECT VideoID FROM "YouTubeVideos" WHERE PodcastID = {pod} AND YouTubeVideoID = '{yt}'"#))
+                .await
+                .unwrap() as i32
+        }
+    };
+    let rows = |vid: i32| {
+        let app = &app;
+        async move { int(app, &format!(r#"SELECT COUNT(*) FROM "DownloadedVideos" WHERE VideoID = {vid}"#)).await }
+    };
+    let file = app.env.ytdlp_dir.join(format!("{}.mp3", channel.video_id(1)));
+    std::fs::write(&file, b"mp3!").unwrap();
+    let path = file.to_str().unwrap();
+
+    let v1 = video_row(1).await;
+    app.db().add_downloaded_video_by_youtube_id(pod, &channel.video_id(1), path).await.unwrap();
+    app.db().add_downloaded_video(user.id, v1, path).await.unwrap();
+    app.db().add_downloaded_video_by_youtube_id(pod, &channel.video_id(1), path).await.unwrap();
+    assert_eq!(rows(v1).await, Some(1), "recording is idempotent");
+    let size = int(&app, &format!(r#"SELECT DownloadedSize FROM "DownloadedVideos" WHERE VideoID = {v1}"#)).await;
+    assert_eq!(size, Some(4), "size comes from the file");
+    let owner = int(&app, &format!(r#"SELECT UserID FROM "DownloadedVideos" WHERE VideoID = {v1}"#)).await;
+    assert_eq!(owner, Some(user.id as i64), "the podcast's owner is resolved");
+
+    let v2 = video_row(2).await;
+    let missing = app.env.ytdlp_dir.join("not-there.mp3");
+    app.db().add_downloaded_video(user.id, v2, missing.to_str().unwrap()).await.unwrap();
+    assert_eq!(rows(v2).await, Some(0), "no row for a file that isn't on disk");
+    app.db().add_downloaded_video_by_youtube_id(pod, "nosuchvideo", path).await.unwrap();
+}

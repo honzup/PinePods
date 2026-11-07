@@ -923,6 +923,9 @@ impl TaskSpawner {
                 // Check if file already exists
                 if tokio::fs::metadata(&output_path).await.is_ok() {
                     tracing::info!("Video {} already downloaded", video_title);
+                    if let Err(e) = db_pool.add_downloaded_video(user_id, video_id, &output_path).await {
+                        tracing::warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+                    }
                     return Ok(serde_json::json!({
                         "video_id": video_id,
                         "status": "already_downloaded",
@@ -945,7 +948,13 @@ impl TaskSpawner {
                         } else {
                             tracing::warn!("Could not read duration from MP3 file: {}", output_path);
                         }
-                        
+
+                        // Record the download so the "downloaded" badge lights up. video_id is the
+                        // internal YouTubeVideos.videoid; user_id comes from the request.
+                        if let Err(e) = db_pool.add_downloaded_video(user_id, video_id, &output_path).await {
+                            tracing::warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+                        }
+
                         Ok(serde_json::json!({
                             "video_id": video_id,
                             "user_id": user_id,
@@ -1127,12 +1136,14 @@ impl TaskSpawner {
                             .map_err(|e| crate::error::AppError::internal(&format!("Failed to get videos: {}", e)))?;
                         
                         rows.into_iter().map(|row| {
+                            let video_id: i32 = row.try_get("videoid")
+                                .map_err(|e| crate::error::AppError::internal(&format!("Failed to get video ID: {}", e)))?;
                             let youtube_video_id: String = row.try_get("youtubevideoid")
                                 .map_err(|e| crate::error::AppError::internal(&format!("Failed to get YouTube video ID: {}", e)))?;
                             let video_title: String = row.try_get("videotitle")
                                 .map_err(|e| crate::error::AppError::internal(&format!("Failed to get video title: {}", e)))?;
-                            Ok((youtube_video_id, video_title))
-                        }).collect::<Result<Vec<(String, String)>, crate::error::AppError>>()?
+                            Ok((video_id, youtube_video_id, video_title))
+                        }).collect::<Result<Vec<(i32, String, String)>, crate::error::AppError>>()?
                     }
                     crate::database::DatabasePool::MySQL(pool) => {
                         let rows = sqlx::query("SELECT VideoID, YouTubeVideoID, VideoTitle FROM YouTubeVideos WHERE PodcastID = ?")
@@ -1142,12 +1153,14 @@ impl TaskSpawner {
                             .map_err(|e| crate::error::AppError::internal(&format!("Failed to get videos: {}", e)))?;
                         
                         rows.into_iter().map(|row| {
+                            let video_id: i32 = row.try_get("VideoID")
+                                .map_err(|e| crate::error::AppError::internal(&format!("Failed to get video ID: {}", e)))?;
                             let youtube_video_id: String = row.try_get("YouTubeVideoID")
                                 .map_err(|e| crate::error::AppError::internal(&format!("Failed to get YouTube video ID: {}", e)))?;
                             let video_title: String = row.try_get("VideoTitle")
                                 .map_err(|e| crate::error::AppError::internal(&format!("Failed to get video title: {}", e)))?;
-                            Ok((youtube_video_id, video_title))
-                        }).collect::<Result<Vec<(String, String)>, crate::error::AppError>>()?
+                            Ok((video_id, youtube_video_id, video_title))
+                        }).collect::<Result<Vec<(i32, String, String)>, crate::error::AppError>>()?
                     }
                 };
                 
@@ -1156,7 +1169,7 @@ impl TaskSpawner {
                 let mut already_downloaded = 0;
                 let mut failed = 0;
                 
-                for (index, (youtube_video_id, video_title)) in videos_data.iter().enumerate() {
+                for (index, (video_id, youtube_video_id, video_title)) in videos_data.iter().enumerate() {
                     
                     let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", youtube_video_id);
                     
@@ -1168,6 +1181,9 @@ impl TaskSpawner {
                     if tokio::fs::metadata(&output_path).await.is_ok() {
                         tracing::info!("Video {} already downloaded", video_title);
                         already_downloaded += 1;
+                        if let Err(e) = db_pool.add_downloaded_video(user_id, *video_id, &output_path).await {
+                            tracing::warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+                        }
                         continue;
                     }
                     
@@ -1186,6 +1202,10 @@ impl TaskSpawner {
                                 }
                             } else {
                                 tracing::warn!("Could not read duration from MP3 file: {}", output_path);
+                            }
+
+                            if let Err(e) = db_pool.add_downloaded_video(user_id, *video_id, &output_path).await {
+                                tracing::warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
                             }
                         }
                         Err(e) => {

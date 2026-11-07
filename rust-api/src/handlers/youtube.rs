@@ -683,7 +683,13 @@ pub async fn process_youtube_channel(
     let details = if wanted.is_empty() { HashMap::new() } else { fetch_video_details(&wanted).await? };
 
     let mut new_episodes = Vec::new();
-    let mut stored: HashSet<String> = have.iter().flatten().cloned().collect();
+    // Which subscriber podcasts hold each video, so its download is recorded for each of them.
+    let mut stored: HashMap<String, Vec<i32>> = HashMap::new();
+    for (sub, have) in subscribers.iter().zip(&have) {
+        for id in have {
+            stored.entry(id.clone()).or_default().push(sub.podcast_id);
+        }
+    }
     for (sub, have) in subscribers.iter().zip(&have) {
         let videos: Vec<&VideoDetails> = wanted
             .iter()
@@ -695,14 +701,19 @@ pub async fn process_youtube_channel(
             heal_channel_metadata(state, sub.podcast_id, first).await;
             let inserted = state.db_pool.add_youtube_videos(sub.podcast_id, &videos).await?;
             debug!("Podcast {}: {} new videos", sub.podcast_id, inserted.len());
-            stored.extend(videos.iter().map(|d| d.id.clone()));
+            for d in &videos {
+                stored.entry(d.id.clone()).or_default().push(sub.podcast_id);
+            }
             new_episodes.extend(inserted);
         }
         state.db_pool.update_episode_count(sub.podcast_id).await?;
     }
 
     // Audio of the listed videos a subscriber keeps (so never past the longest cutoff).
-    let keep: Vec<&str> = listed.iter().map(|v| v.id.as_str()).filter(|id| stored.contains(*id)).collect();
+    let keep: Vec<(&str, &[i32])> = listed
+        .iter()
+        .filter_map(|v| stored.get(&v.id).map(|pods| (v.id.as_str(), pods.as_slice())))
+        .collect();
     download_missing_audio(state, &keep).await;
 
     Ok(new_episodes)
@@ -751,13 +762,29 @@ async fn heal_channel_metadata(state: &AppState, podcast_id: i32, video: &VideoD
     }
 }
 
-// Download the audio of these videos where it isn't on disk yet.
-async fn download_missing_audio(state: &AppState, video_ids: &[&str]) {
+// Record a video's audio file as downloaded for each subscriber podcast that holds it.
+async fn record_downloads(state: &AppState, video_id: &str, podcast_ids: &[i32], path: &str) {
+    for &podcast_id in podcast_ids {
+        if let Err(e) = state.db_pool.add_downloaded_video_by_youtube_id(podcast_id, video_id, path).await {
+            warn!("Failed to record DownloadedVideos for video {}: {}", video_id, e);
+        }
+    }
+}
+
+// Download the audio of these videos where it isn't on disk yet, and record it as downloaded for
+// the subscriber podcasts holding each one (also when the file was already there, e.g. fetched
+// for another subscriber or played lazily).
+async fn download_missing_audio(state: &AppState, videos: &[(&str, &[i32])]) {
     let (mut downloaded, mut failed) = (0, 0);
-    for video_id in video_ids {
+    for &(video_id, podcast_ids) in videos {
         let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", video_id);
         let output_path_double = format!("{}.mp3", output_path);
-        if tokio::fs::metadata(&output_path).await.is_ok() || tokio::fs::metadata(&output_path_double).await.is_ok() {
+        if tokio::fs::metadata(&output_path).await.is_ok() {
+            record_downloads(state, video_id, podcast_ids, &output_path).await;
+            continue;
+        }
+        if tokio::fs::metadata(&output_path_double).await.is_ok() {
+            record_downloads(state, video_id, podcast_ids, &output_path_double).await;
             continue;
         }
         debug!("Downloading audio of video {} to {}", video_id, output_path);
@@ -776,6 +803,7 @@ async fn download_missing_audio(state: &AppState, video_ids: &[&str]) {
                     }
                     None => debug!("Could not read duration from MP3 file: {}", output_path),
                 }
+                record_downloads(state, video_id, podcast_ids, &output_path).await;
             }
             Err(e) => {
                 failed += 1;
