@@ -3298,6 +3298,27 @@ pub struct StreamQuery {
     pub source_type: Option<String>,
 }
 
+/// Download a YouTube video's audio for playback (blocking until it's on disk), record it and
+/// return its path. The caller holds the video's `play_download_lock`.
+async fn download_youtube_on_play(state: &crate::AppState, video_id: &str, episode_id: i32, user_id: i32) -> Result<String, AppError> {
+    let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", video_id);
+    info!("Downloading YouTube video {} on first play", video_id);
+    crate::handlers::youtube::download_youtube_audio(video_id, &output_path).await?;
+    if let Some(duration) = crate::handlers::youtube::get_mp3_duration(&output_path) {
+        if let Err(e) = state.db_pool.update_youtube_video_duration(video_id, duration).await {
+            warn!("Failed to update duration for video {}: {}", video_id, e);
+        }
+    }
+    if let Err(e) = state.db_pool.add_downloaded_video(user_id, episode_id, &output_path).await {
+        warn!("Failed to record DownloadedVideos for video {}: {}", episode_id, e);
+    }
+    state
+        .db_pool
+        .get_youtube_video_location(episode_id, user_id)
+        .await?
+        .ok_or_else(|| AppError::external_error(&format!("yt-dlp wrote no audio for video {}", video_id)))
+}
+
 // Stream episode - matches Python stream_episode function exactly
 #[utoipa::path(
     get,
@@ -3396,6 +3417,20 @@ pub async fn stream_episode(
         info!("Looking up regular episode file path");
         state.db_pool.get_download_location(episode_id, query.user_id).await?
     };
+
+    // YouTube videos are indexed further back than their audio is downloaded (the cutoff only
+    // bounds eager downloads), so a video without audio on disk is downloaded now, then served.
+    if file_path.is_none() && query.source_type.as_deref() == Some("youtube") {
+        if let Some(video_id) = state.db_pool.get_youtube_video_id(episode_id, query.user_id).await? {
+            let lock = crate::handlers::youtube::play_download_lock(&video_id);
+            let _guard = lock.lock().await;
+            // Another request may have finished the download while this one waited.
+            file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
+            if file_path.is_none() {
+                file_path = Some(download_youtube_on_play(&state, &video_id, episode_id, query.user_id).await?);
+            }
+        }
+    }
 
     // Fall back to local-media episodes, which are not recorded in DownloadedEpisodes.
     // Their episode URL is a local:// pseudo-URL pointing under /opt/pinepods/local-media.

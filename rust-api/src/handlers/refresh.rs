@@ -488,7 +488,8 @@ pub async fn import_added_channel(state: &AppState, podcast_id: i32, channel_id:
         refresh_interval: None,
     };
     let group = feed_group(state, feed_id, item).await?;
-    refresh_youtube_group(state, &group).await?;
+    // The first import lists the channel's back catalogue, not just the feed's 15 newest.
+    refresh_youtube_group_with(state, &group, true).await?;
     Ok(())
 }
 
@@ -508,6 +509,16 @@ async fn mark_failed(state: &AppState, ids: &[i32], kind: FeedErrorKind, error: 
 async fn refresh_youtube_group(
     state: &AppState,
     group: &[PodcastRefreshItem],
+) -> AppResult<Vec<crate::handlers::podcasts::Episode>> {
+    refresh_youtube_group_with(state, group, false).await
+}
+
+/// `refresh_youtube_group`; `deep` lists the channel's back catalogue with yt-dlp (up to
+/// `YOUTUBE_CHANNEL_LIMIT`) instead of reading its feed, for a channel's first import.
+async fn refresh_youtube_group_with(
+    state: &AppState,
+    group: &[PodcastRefreshItem],
+    deep: bool,
 ) -> AppResult<Vec<crate::handlers::podcasts::Episode>> {
     use crate::handlers::youtube::{self, ChannelListing, ChannelSubscriber};
     let rep = &group[0];
@@ -529,7 +540,12 @@ async fn refresh_youtube_group(
         None => crate::database::FeedValidators::default(),
     };
 
-    match youtube::list_channel_videos(state, channel_id, validators).await {
+    let listing = if deep {
+        youtube::list_channel_videos_deep(state, channel_id).await
+    } else {
+        youtube::list_channel_videos(state, channel_id, validators).await
+    };
+    match listing {
         Ok(ChannelListing::Unchanged { etag, last_modified }) => {
             if etag.is_some() || last_modified.is_some() {
                 let _ = state

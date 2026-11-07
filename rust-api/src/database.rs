@@ -742,8 +742,10 @@ impl DatabasePool {
                         LEFT JOIN "DownloadedVideos" ON
                             "YouTubeVideos".videoid = "DownloadedVideos".videoid
                             AND "DownloadedVideos".userid = $4
-                        WHERE "YouTubeVideos".publishedat >= NOW() - INTERVAL '30 days'
-                        AND "YouTubeVideos".publishedat > $7
+                        -- No 30-day gate on YouTube videos: the whole indexed channel history is
+                        -- reachable (older videos are downloaded on first play). The since bind
+                        -- ($7) still applies.
+                        WHERE "YouTubeVideos".publishedat > $7
                         AND "Podcasts".userid = $5
                     ) combined
                     ORDER BY episodepubdate DESC
@@ -875,8 +877,8 @@ impl DatabasePool {
                         LEFT JOIN DownloadedVideos ON
                             YouTubeVideos.VideoID = DownloadedVideos.VideoID
                             AND DownloadedVideos.UserID = ?
-                        WHERE YouTubeVideos.PublishedAt >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-                        AND YouTubeVideos.PublishedAt > ?
+                        -- No 30-day gate on YouTube videos (see the Postgres branch).
+                        WHERE YouTubeVideos.PublishedAt > ?
                         AND Podcasts.UserID = ?
                     ) combined
                     ORDER BY episodepubdate DESC
@@ -17107,6 +17109,32 @@ impl DatabasePool {
         Ok(ids.into_iter().flatten().collect())
     }
 
+    // YouTube IDs of a channel podcast's stored videos with their publish dates.
+    pub async fn youtube_video_dates(&self, podcast_id: i32) -> AppResult<std::collections::HashMap<String, DateTime<Utc>>> {
+        // PublishedAt is TIMESTAMP (no zone) on Postgres but a MySQL TIMESTAMP, which sqlx only
+        // decodes as DateTime<Utc>.
+        let rows: Vec<(Option<String>, Option<DateTime<Utc>>)> = match self {
+            DatabasePool::Postgres(pool) => {
+                let rows: Vec<(Option<String>, Option<chrono::NaiveDateTime>)> =
+                    sqlx::query_as(r#"SELECT youtubevideoid, publishedat FROM "YouTubeVideos" WHERE podcastid = $1"#)
+                        .bind(podcast_id)
+                        .fetch_all(pool)
+                        .await?;
+                rows.into_iter().map(|(id, p)| (id, p.map(|p| p.and_utc()))).collect()
+            }
+            DatabasePool::MySQL(pool) => {
+                sqlx::query_as("SELECT YouTubeVideoID, PublishedAt FROM YouTubeVideos WHERE PodcastID = ?")
+                    .bind(podcast_id)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, published)| Some((id?, published.unwrap_or(DateTime::<Utc>::MIN_UTC))))
+            .collect())
+    }
+
     // Video filters of these channel podcasts; podcasts without any are left out.
     pub async fn youtube_video_filters(
         &self,
@@ -20627,6 +20655,33 @@ impl DatabasePool {
         }
 
         Ok(())
+    }
+
+    // The YouTube id (e.g. "dQw4w9WgXcQ") of a user's video row, whether or not its audio is on
+    // disk yet. Used by the lazy download-on-play path in stream_episode.
+    pub async fn get_youtube_video_id(&self, episode_id: i32, user_id: i32) -> AppResult<Option<String>> {
+        match self {
+            DatabasePool::Postgres(pool) => Ok(sqlx::query_scalar(r#"
+                    SELECT "YouTubeVideos".youtubevideoid
+                    FROM "YouTubeVideos"
+                    INNER JOIN "Podcasts" ON "YouTubeVideos".podcastid = "Podcasts".podcastid
+                    WHERE "YouTubeVideos".videoid = $1 AND "Podcasts".userid = $2
+                "#)
+                .bind(episode_id)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?),
+            DatabasePool::MySQL(pool) => Ok(sqlx::query_scalar(r#"
+                    SELECT YouTubeVideos.YouTubeVideoID
+                    FROM YouTubeVideos
+                    INNER JOIN Podcasts ON YouTubeVideos.PodcastID = Podcasts.PodcastID
+                    WHERE YouTubeVideos.VideoID = ? AND Podcasts.UserID = ?
+                "#)
+                .bind(episode_id)
+                .bind(user_id)
+                .fetch_optional(pool)
+                .await?),
+        }
     }
 
     // Get YouTube video location - matches Python get_youtube_video_location function exactly

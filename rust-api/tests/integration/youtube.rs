@@ -44,6 +44,9 @@ async fn an_unchanged_channel_feed_runs_no_ytdlp() {
     let mut channel = app.youtube_channel("same").video(1, 2).video(2, 1);
     app.publish_channel(&channel);
     let pod = app.subscribe_channel(&user, &channel, 30).await;
+    // The import lists the channel with yt-dlp, so the first refresh reads and applies the feed.
+    app.refresh().await;
+    assert_eq!(app.channel_feed_hits(&channel), 1);
     let calls = app.ytdlp_calls(&channel).len();
 
     // View counts change on every fetch; that alone isn't a change.
@@ -59,17 +62,27 @@ async fn an_unchanged_channel_feed_runs_no_ytdlp() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_channel_is_fetched_once_for_all_subscribers_up_to_the_longest_cutoff() {
+async fn a_channel_is_fetched_once_for_all_subscribers_and_audio_only_within_each_cutoff() {
     let app = TestApp::new().await;
     let long = app.user("long").await;
     let short = app.user("short").await;
     let channel = app.youtube_channel("shared").video(1, 90).video(2, 45).video(3, 5);
     app.publish_channel(&channel);
 
+    // The cutoff no longer limits what is indexed (old videos are played on demand), only which
+    // audio is downloaded up front.
     let long_pod = app.subscribe_channel(&long, &channel, 60).await;
     let short_pod = app.subscribe_channel(&short, &channel, 30).await;
-    assert_eq!(app.video_ids(long_pod).await, vec![channel.video_id(2), channel.video_id(3)]);
-    assert_eq!(app.video_ids(short_pod).await, vec![channel.video_id(3)]);
+    let all = vec![channel.video_id(1), channel.video_id(2), channel.video_id(3)];
+    assert_eq!(app.video_ids(long_pod).await, all);
+    assert_eq!(app.video_ids(short_pod).await, all);
+    let audio = |app: &TestApp, channel: &crate::harness::youtube::Channel, n: u32| {
+        let id = channel.video_id(n);
+        app.ytdlp_calls(channel).iter().any(|c| c.contains("--extract-audio") && c.contains(&id))
+    };
+    assert!(!audio(&app, &channel, 1), "no audio past the longest cutoff");
+    assert!(audio(&app, &channel, 2), "audio within the longest cutoff");
+    assert!(audio(&app, &channel, 3));
 
     let channel = channel.video(4, 0);
     app.publish_channel(&channel);
@@ -79,10 +92,7 @@ async fn a_channel_is_fetched_once_for_all_subscribers_up_to_the_longest_cutoff(
     assert_eq!(app.ytdlp_detail_requests(&channel).last().unwrap(), &vec![channel.video_id(4)], "one yt-dlp run for both");
     assert!(app.video_ids(long_pod).await.contains(&channel.video_id(4)));
     assert!(app.video_ids(short_pod).await.contains(&channel.video_id(4)));
-
-    let asked: Vec<String> = app.ytdlp_detail_requests(&channel).concat();
-    assert!(!asked.contains(&channel.video_id(1)), "nothing past the longest cutoff is fetched: {asked:?}");
-    assert!(app.ytdlp_calls(&channel).iter().all(|c| !c.contains(&channel.video_id(1))));
+    assert!(!audio(&app, &channel, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -398,4 +408,118 @@ async fn downloaded_videos_are_recorded_once_and_only_when_on_disk() {
     app.db().add_downloaded_video(user.id, v2, missing.to_str().unwrap()).await.unwrap();
     assert_eq!(rows(v2).await, Some(0), "no row for a file that isn't on disk");
     app.db().add_downloaded_video_by_youtube_id(pod, "nosuchvideo", path).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_import_lists_the_channel_deep_and_refreshes_use_the_feed() {
+    let app = TestApp::new().await;
+    let user = app.user("deep").await;
+    let mut channel = app.youtube_channel("deep");
+    for n in 1..=20 {
+        channel = channel.video(n, 200 - n as i64 * 10);
+    }
+    app.publish_channel(&channel);
+    // The feed only carries the 15 newest, like YouTube's.
+    let mut feed = channel.clone();
+    feed.videos.truncate(15);
+    app.fixtures().serve(&format!("youtube/{}.xml", channel.id), Fixture::new("application/atom+xml", feed.to_atom()));
+
+    let pod = app.subscribe_channel(&user, &channel, 30).await;
+    assert_eq!(app.video_ids(pod).await.len(), 20, "the import indexes past the feed's 15");
+    assert!(
+        app.ytdlp_calls(&channel).iter().any(|c| c.contains("--flat-playlist") && c.contains("--playlist-end 300")),
+        "deep listing up to YOUTUBE_CHANNEL_LIMIT (default 300): {:?}",
+        app.ytdlp_calls(&channel)
+    );
+    let audio: Vec<String> = app.ytdlp_calls(&channel).into_iter().filter(|c| c.contains("--extract-audio")).collect();
+    assert_eq!(audio.len(), 3, "only videos within the cutoff (0, 10, 20 days old) are downloaded up front: {audio:?}");
+
+    let listings = app.ytdlp_calls(&channel).iter().filter(|c| c.contains("--flat-playlist")).count();
+    let hits = app.channel_feed_hits(&channel);
+    app.refresh().await;
+    assert_eq!(app.channel_feed_hits(&channel), hits + 1, "a regular refresh reads the feed");
+    assert_eq!(app.ytdlp_calls(&channel).iter().filter(|c| c.contains("--flat-playlist")).count(), listings);
+    assert_eq!(app.video_ids(pod).await.len(), 20, "refreshes don't prune old videos");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn old_videos_show_in_recent_episodes() {
+    let app = TestApp::new().await;
+    let user = app.user("recent").await;
+    let channel = app.youtube_channel("recent").video(1, 90).video(2, 1);
+    app.publish_channel(&channel);
+    app.subscribe_channel(&user, &channel, 30).await;
+
+    let body = app.get(&format!("/api/data/return_episodes/{}", user.id)).key(&user).send().await.ok_json();
+    let titles: Vec<String> = body["episodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["episodetitle"].as_str().or(e["Episodetitle"].as_str()).map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"Video 1".to_string()), "a 90-day-old video is listed: {body}");
+    assert!(titles.contains(&"Video 2".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_youtube_position_is_read_back_and_reset_when_uncompleted() {
+    let app = TestApp::new().await;
+    let user = app.user("resume").await;
+    let channel = app.youtube_channel("resume").video(1, 1);
+    app.publish_channel(&channel);
+    let pod = app.subscribe_channel(&user, &channel, 30).await;
+    let vid = int(&app, &format!(r#"SELECT VideoID FROM "YouTubeVideos" WHERE PodcastID = {pod}"#)).await.unwrap();
+    let position = || async { int(&app, &format!(r#"SELECT ListenPosition FROM "YouTubeVideos" WHERE VideoID = {vid}"#)).await };
+
+    app.post("/api/data/record_listen_duration")
+        .key(&user)
+        .json(&json!({ "episode_id": vid, "user_id": user.id, "listen_duration": 120.0, "is_youtube": true }))
+        .send()
+        .await
+        .assert_ok();
+    assert_eq!(position().await, Some(120), "the position is mirrored onto the video");
+
+    app.post("/api/data/mark_episode_uncompleted")
+        .key(&user)
+        .json(&json!({ "episode_id": vid, "user_id": user.id, "is_youtube": true }))
+        .send()
+        .await
+        .assert_ok();
+    assert_eq!(position().await, Some(0), "marking it unplayed restarts it");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn playing_a_video_without_audio_downloads_it_on_demand() {
+    let app = TestApp::new().await;
+    let user = app.user("lazy").await;
+    let other = app.user("other").await;
+    let channel = app.youtube_channel("lazy").video(1, 90);
+    app.publish_channel(&channel);
+    let pod = app.subscribe_channel(&user, &channel, 30).await;
+    let vid = int(&app, &format!(r#"SELECT VideoID FROM "YouTubeVideos" WHERE PodcastID = {pod}"#)).await.unwrap();
+    let audio_runs = || app.ytdlp_calls(&channel).into_iter().filter(|c| c.contains(&format!("watch?v={}", channel.video_id(1))) && !c.contains("--dump-json")).count();
+    assert_eq!(audio_runs(), 0, "past the cutoff: indexed, not downloaded");
+
+    // Someone else's key can't make the server fetch it.
+    let theirs = app
+        .get(&format!("/api/data/stream/{vid}"))
+        .query("api_key", &other.api_key)
+        .query("user_id", other.id)
+        .query("type", "youtube")
+        .send()
+        .await;
+    assert_eq!(theirs.status.as_u16(), 404, "{}", theirs.text());
+    assert_eq!(audio_runs(), 0);
+
+    // The stub yt-dlp writes no audio, so the download "fails" – but it was attempted rather
+    // than answering 404 for an indexed video.
+    let resp = app
+        .get(&format!("/api/data/stream/{vid}"))
+        .query("api_key", &user.api_key)
+        .query("user_id", user.id)
+        .query("type", "youtube")
+        .send()
+        .await;
+    assert_ne!(resp.status.as_u16(), 404, "{}", resp.text());
+    assert!(audio_runs() >= 1, "yt-dlp fetched the audio: {:?}", app.ytdlp_calls(&channel));
 }

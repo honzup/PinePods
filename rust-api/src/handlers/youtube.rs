@@ -441,7 +441,7 @@ pub async fn list_channel_videos(
         Err(e) => e,
     };
     warn!("Feed of YouTube channel {} failed ({}), listing it with yt-dlp", channel_id, error);
-    match list_channel_videos_flat(channel_id).await {
+    match list_channel_videos_flat(channel_id, 15).await {
         Ok(videos) => Ok(ChannelListing::Listed { videos, etag: None, last_modified: None, content_hash: None }),
         Err(e) => {
             warn!("yt-dlp listing of YouTube channel {} failed too: {}", channel_id, e);
@@ -488,18 +488,42 @@ fn parse_channel_feed(body: &str) -> Result<Vec<ListedVideo>, AppError> {
         .collect())
 }
 
-/// A channel's 15 newest videos from yt-dlp, without fetching each one.
-async fn list_channel_videos_flat(channel_id: &str) -> Result<Vec<ListedVideo>, AppError> {
+/// How many of a channel's newest videos the first import lists (`YOUTUBE_CHANNEL_LIMIT`,
+/// default 300; 0 lists the whole channel). Regular refreshes only read the channel's feed.
+pub fn channel_listing_limit() -> u32 {
+    std::env::var("YOUTUBE_CHANNEL_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(300)
+}
+
+/// A newly added channel's back catalogue: up to `channel_listing_limit` of its newest videos
+/// from yt-dlp's flat listing, falling back to the regular feed listing when that fails.
+pub async fn list_channel_videos_deep(state: &AppState, channel_id: &str) -> Result<ChannelListing, AppError> {
+    match list_channel_videos_flat(channel_id, channel_listing_limit()).await {
+        Ok(videos) if !videos.is_empty() => {
+            debug!("Deep listing of YouTube channel {}: {} videos", channel_id, videos.len());
+            Ok(ChannelListing::Listed { videos, etag: None, last_modified: None, content_hash: None })
+        }
+        Ok(_) => list_channel_videos(state, channel_id, crate::database::FeedValidators::default()).await,
+        Err(e) => {
+            warn!("Deep listing of YouTube channel {} failed ({}), reading its feed", channel_id, e);
+            list_channel_videos(state, channel_id, crate::database::FeedValidators::default()).await
+        }
+    }
+}
+
+/// A channel's `limit` newest videos (0 = all) from yt-dlp, without fetching each one.
+async fn list_channel_videos_flat(channel_id: &str, limit: u32) -> Result<Vec<ListedVideo>, AppError> {
     let channel_url = format!("https://www.youtube.com/channel/{}/videos", channel_id);
+    let limit = limit.to_string();
+    let mut args = vec!["--quiet", "--no-warnings", "--flat-playlist", "--dump-json"];
+    if limit != "0" {
+        args.extend(["--playlist-end", limit.as_str()]);
+    }
+    args.push(&channel_url);
     let _permit = crate::services::ytdlp::refresh_permit().await;
-    let output = run_ytdlp(&[
-        "--quiet",
-        "--no-warnings",
-        "--flat-playlist",
-        "--dump-json",
-        "--playlist-end", "15",
-        &channel_url,
-    ]).await?;
+    let output = run_ytdlp(&args).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(AppError::external_error(&format!("yt-dlp channel listing failed: {}", stderr.trim())));
@@ -645,15 +669,22 @@ impl YouTubeVideoFilter {
 /// A channel subscription brought up to date by `process_youtube_channel`.
 pub struct ChannelSubscriber {
     pub podcast_id: i32,
-    /// Days of videos to keep; 0 or less keeps everything the channel lists.
+    /// Days of videos whose audio is downloaded up front; 0 or less downloads everything listed.
+    /// Older videos are still indexed and are downloaded when first played.
     pub feed_cutoff: i32,
     pub filter: YouTubeVideoFilter,
 }
 
-/// Bring a channel's subscriptions up to date with its newest videos: drop videos past each
-/// subscriber's cutoff, fetch the details of the listed videos a subscriber is missing and would
-/// take (one yt-dlp run, never past the longest cutoff), insert the ones its filter lets through,
-/// and download their audio. Returns the inserted rows.
+/// Videos whose details one yt-dlp run fetches; a deep first import is split into runs of this
+/// size so the refresh's yt-dlp permit is shared and progress is stored as it goes.
+const DETAILS_BATCH: usize = 50;
+
+/// Bring a channel's subscriptions up to date with the listed videos: fetch the details of the
+/// listed videos a subscriber is missing and would take (one yt-dlp run per batch), insert the
+/// ones its filter lets through, and download the audio of the ones within its cutoff. Every
+/// listed video is indexed whatever its age and nothing is pruned, so a deep first import
+/// survives refreshes; older videos are downloaded on first play (see `stream_episode`).
+/// Returns the inserted rows.
 pub async fn process_youtube_channel(
     state: &AppState,
     subscribers: &[ChannelSubscriber],
@@ -663,56 +694,55 @@ pub async fn process_youtube_channel(
     let cutoff = |sub: &ChannelSubscriber| (sub.feed_cutoff > 0).then(|| now - chrono::Duration::days(sub.feed_cutoff as i64));
     let in_cutoff = |sub: &ChannelSubscriber, published| cutoff(sub).map_or(true, |c| published > c);
 
-    let mut have: Vec<HashSet<String>> = Vec::with_capacity(subscribers.len());
+    // Per subscriber: its stored videos and when they were published.
+    let mut have: Vec<HashMap<String, chrono::DateTime<chrono::Utc>>> = Vec::with_capacity(subscribers.len());
     for sub in subscribers {
-        if let Some(cutoff) = cutoff(sub) {
-            state.db_pool.remove_old_youtube_videos(sub.podcast_id, cutoff).await?;
-        }
-        have.push(state.db_pool.youtube_video_ids(sub.podcast_id).await?);
+        have.push(state.db_pool.youtube_video_dates(sub.podcast_id).await?);
     }
-    let missing = |video: &ListedVideo, sub: &ChannelSubscriber, have: &HashSet<String>| {
-        !have.contains(&video.id)
-            && video.published.map_or(true, |p| in_cutoff(sub, p))
-            && video.title.as_deref().map_or(true, |t| sub.filter.title_ok(t))
+    let missing = |video: &ListedVideo, sub: &ChannelSubscriber, have: &HashMap<String, chrono::DateTime<chrono::Utc>>| {
+        !have.contains_key(&video.id) && video.title.as_deref().map_or(true, |t| sub.filter.title_ok(t))
     };
     let wanted: Vec<String> = listed
         .iter()
         .filter(|v| subscribers.iter().zip(&have).any(|(sub, have)| missing(v, sub, have)))
         .map(|v| v.id.clone())
         .collect();
-    let details = if wanted.is_empty() { HashMap::new() } else { fetch_video_details(&wanted).await? };
 
     let mut new_episodes = Vec::new();
-    // Which subscriber podcasts hold each video, so its download is recorded for each of them.
-    let mut stored: HashMap<String, Vec<i32>> = HashMap::new();
-    for (sub, have) in subscribers.iter().zip(&have) {
-        for id in have {
-            stored.entry(id.clone()).or_default().push(sub.podcast_id);
+    for batch in wanted.chunks(DETAILS_BATCH) {
+        let details = fetch_video_details(batch).await?;
+        for (sub, have) in subscribers.iter().zip(have.iter_mut()) {
+            let videos: Vec<&VideoDetails> = batch
+                .iter()
+                .filter(|id| !have.contains_key(*id))
+                .filter_map(|id| details.get(id))
+                .filter(|d| sub.filter.title_ok(&d.title) && sub.filter.length_ok(d.duration))
+                .collect();
+            if let Some(first) = videos.first() {
+                heal_channel_metadata(state, sub.podcast_id, first).await;
+                let inserted = state.db_pool.add_youtube_videos(sub.podcast_id, &videos).await?;
+                debug!("Podcast {}: {} new videos", sub.podcast_id, inserted.len());
+                have.extend(videos.iter().map(|d| (d.id.clone(), d.published)));
+                new_episodes.extend(inserted);
+            }
         }
     }
-    for (sub, have) in subscribers.iter().zip(&have) {
-        let videos: Vec<&VideoDetails> = wanted
-            .iter()
-            .filter(|id| !have.contains(*id))
-            .filter_map(|id| details.get(id))
-            .filter(|d| in_cutoff(sub, d.published) && sub.filter.title_ok(&d.title) && sub.filter.length_ok(d.duration))
-            .collect();
-        if let Some(first) = videos.first() {
-            heal_channel_metadata(state, sub.podcast_id, first).await;
-            let inserted = state.db_pool.add_youtube_videos(sub.podcast_id, &videos).await?;
-            debug!("Podcast {}: {} new videos", sub.podcast_id, inserted.len());
-            for d in &videos {
-                stored.entry(d.id.clone()).or_default().push(sub.podcast_id);
-            }
-            new_episodes.extend(inserted);
-        }
+    for sub in subscribers {
         state.db_pool.update_episode_count(sub.podcast_id).await?;
     }
 
-    // Audio of the listed videos a subscriber keeps (so never past the longest cutoff).
-    let keep: Vec<(&str, &[i32])> = listed
+    // Audio of the listed videos a subscriber holds within its cutoff, recorded for each of them.
+    let keep: Vec<(&str, Vec<i32>)> = listed
         .iter()
-        .filter_map(|v| stored.get(&v.id).map(|pods| (v.id.as_str(), pods.as_slice())))
+        .filter_map(|v| {
+            let pods: Vec<i32> = subscribers
+                .iter()
+                .zip(&have)
+                .filter(|(sub, have)| have.get(&v.id).is_some_and(|p| in_cutoff(sub, *p)))
+                .map(|(sub, _)| sub.podcast_id)
+                .collect();
+            (!pods.is_empty()).then_some((v.id.as_str(), pods))
+        })
         .collect();
     download_missing_audio(state, &keep).await;
 
@@ -774,9 +804,10 @@ async fn record_downloads(state: &AppState, video_id: &str, podcast_ids: &[i32],
 // Download the audio of these videos where it isn't on disk yet, and record it as downloaded for
 // the subscriber podcasts holding each one (also when the file was already there, e.g. fetched
 // for another subscriber or played lazily).
-async fn download_missing_audio(state: &AppState, videos: &[(&str, &[i32])]) {
+async fn download_missing_audio(state: &AppState, videos: &[(&str, Vec<i32>)]) {
     let (mut downloaded, mut failed) = (0, 0);
-    for &(video_id, podcast_ids) in videos {
+    for (video_id, podcast_ids) in videos {
+        let (video_id, podcast_ids) = (*video_id, podcast_ids.as_slice());
         let output_path = format!("/opt/pinepods/downloads/youtube/{}.mp3", video_id);
         let output_path_double = format!("{}.mp3", output_path);
         if tokio::fs::metadata(&output_path).await.is_ok() {
@@ -821,6 +852,18 @@ async fn download_missing_audio(state: &AppState, videos: &[(&str, &[i32])]) {
     }
 }
 
+
+// Per-video locks for downloads on play: players fire several requests at an audio source at
+// once, and without a lock each would start its own yt-dlp run for the same file. The map only
+// guards itself (never held across an await); entries stay, one small Arc per video ever played
+// before it was downloaded.
+static PLAY_DOWNLOAD_LOCKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The lock serialising downloads-on-play of this video.
+pub fn play_download_lock(video_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    PLAY_DOWNLOAD_LOCKS.lock().unwrap().entry(video_id.to_string()).or_default().clone()
+}
 
 // Download YouTube audio using yt-dlp binary
 pub async fn download_youtube_audio(video_id: &str, output_path: &str) -> Result<(), AppError> {
