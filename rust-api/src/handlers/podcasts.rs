@@ -3427,7 +3427,21 @@ pub async fn stream_episode(
             // Another request may have finished the download while this one waited.
             file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
             if file_path.is_none() {
-                file_path = Some(download_youtube_on_play(&state, &video_id, episode_id, query.user_id).await?);
+                // Stream it while it downloads (see handlers/youtube_stream.rs). The lock only
+                // serialises this start-or-attach decision: the body streams after the handler
+                // returns, and further plays of the video attach to the same download.
+                use crate::handlers::youtube_stream::{begin_stream, chunked_response, StreamStart};
+                match begin_stream(&state, &video_id, query.user_id, episode_id).await {
+                    StreamStart::Live(producer) => return Ok(chunked_response(producer)),
+                    StreamStart::Cached => {
+                        file_path = state.db_pool.get_youtube_video_location(episode_id, query.user_id).await?;
+                    }
+                    StreamStart::Fallback => {
+                        // The progressive pipeline can't serve this video; download it whole.
+                        info!("Falling back to a blocking download of YouTube video {}", video_id);
+                        file_path = Some(download_youtube_on_play(&state, &video_id, episode_id, query.user_id).await?);
+                    }
+                }
             }
         }
     }
