@@ -227,7 +227,9 @@ if [[ -n "$PUID" && -n "$PGID" && ! "$PUID" =~ ^0+$ ]]; then
 else
     nginx_owner="nginx:nginx"
 fi
-chown -R "$nginx_owner" /run/nginx /var/lib/nginx /var/log/nginx 2>/dev/null || true
+# Skip symlinks: chowning one copies it up with an overlay xattr that can be listed but not
+# read, and that makes rsync-based LXC backups (Proxmox suspend mode) fail.
+find /run/nginx /var/lib/nginx /var/log/nginx ! -type l -exec chown "$nginx_owner" {} + 2>/dev/null || true
 
 # When PUID/PGID are set, drop privileges and run the whole stack as that user so files
 # are created with correct ownership natively (no per-file chown needed). Otherwise run as root.
